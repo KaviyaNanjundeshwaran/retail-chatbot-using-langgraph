@@ -16,6 +16,8 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
+try { process.loadEnvFile("backend/.env"); } catch {}
+try { process.loadEnvFile("backend/.env.local"); } catch {}
 try { process.loadEnvFile(".env.local"); } catch {}
 const PORT = Number(process.env.MCP_PORT || 3333);
 if (!process.env.PG_URI || !process.env.JWT_SECRET) { console.error("[mcp] PG_URI and JWT_SECRET are required"); process.exit(1); }
