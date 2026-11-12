@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+/* Design tokens (Tailwind v4 theme config): white, Apple-inspired palette and the system font stack. */
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+
+  --color-ink: #1d1d1f;
+  --color-ink-2: #6e6e73;
+  --color-ink-3: #86868b;
+  --color-canvas: #f5f5f7;
+  --color-fill: #e8e8ed;
+  --color-line: #d2d2d7;
+  --color-accent: #0071e3;
+  --color-accent-hover: #0077ed;
+  --color-danger: #d70015;
+  --color-warning: #b25000;
+  --color-success: #248a3d;
+}

@@ -6,17 +6,16 @@
     "dev": "node ./node_modules/tsx/dist/cli.mjs watch src/index.ts",
     "start": "node ./node_modules/tsx/dist/cli.mjs src/index.ts",
     "build": "node ./node_modules/typescript/bin/tsc --noEmit",
-    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit"
+    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
+    "test": "node --import tsx --test test/chat.test.ts",
+    "db:setup": "node ./node_modules/tsx/dist/cli.mjs src/setup.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-sns": "^3.1165.0",
     "@langchain/core": "^1.3.4",
     "@langchain/google-genai": "^2.3.4",
     "@langchain/langgraph": "^1.7.0",
     "@langchain/langgraph-checkpoint-postgres": "^1.1.2",
-    "@langchain/langgraph-sdk": "^1.15.0",
     "@langchain/mistralai": "^1.2.0",
-    "@modelcontextprotocol/sdk": "^1.32.2",
     "bcryptjs": "^3.0.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
@@ -26,6 +25,8 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16",
+    "@electric-sql/pglite-socket": "^0.2.19",
     "@types/bcryptjs": "^2.4.6",
     "@types/cookie-parser": "^1.4.8",
     "@types/cors": "^2.8.19",
@@ -36,4 +37,3 @@
     "typescript": "^7.0.2"
   }
 }
-

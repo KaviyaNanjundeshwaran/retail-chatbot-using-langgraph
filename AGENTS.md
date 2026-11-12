@@ -10,5 +10,14 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 <!-- run command -->
 
-cd frontend
-npm run dev   
+Backend (API on :3001, needs backend/.env, see backend/.env.example):
+
+    cd backend && npm run dev
+
+Frontend (UI on :3000, proxies /api to the backend):
+
+    cd frontend && npm run dev
+
+Tests (in-process Postgres + scripted model, no keys needed):
+
+    cd backend && npm test

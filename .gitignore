@@ -1,6 +1,6 @@
 node_modules
 .next
 .env*
-backend/.env*
+!.env.example
 __pycache__
 *.tsbuildinfo
