@@ -111,7 +111,7 @@ const AFFIRM = /^\s*(yes|yep|yeah|yup|y|confirm(ed)?|ok(ay)?|sure|proceed|go ahe
 /* ---------------- business logic (always scoped to one customer) ---------------- */
 async function eligibility(cid, orderId) {
   const o = await one(
-    `select o.*,p.product_name,p.category,p.returnable,p.replacement_allowed prod_repl,p.exchange_allowed prod_exch
+    `select o.*,p.product_name,p.category,p.returnable,p.replacement_allowed prod_repl,p.exchange_allowed prod_exch,p.image_url
        from orders o left join products p on p.product_id=o.product_id where o.order_id=$1 and o.customer_id=$2`, [orderId, cid]);
   if (!o) return { found: false, eligible: false, reasons: ["No such order on your account."] };
   const item = await one("select order_item_id,return_status from order_items where order_id=$1 and customer_id=$2 limit 1", [orderId, cid]);
@@ -130,7 +130,7 @@ async function eligibility(cid, orderId) {
   if (open) reasons.push(`An open case ${open.case_id} (${open.return_status}) already exists for this item.`);
   const risk = cust?.risk_profile || {};
   return {
-    found: true, order_id: orderId, order_item_id: item?.order_item_id, product_id: o.product_id, product_name: o.product_name,
+    found: true, order_id: orderId, order_item_id: item?.order_item_id, product_id: o.product_id, product_name: o.product_name, image_url: o.image_url,
     category: o.category, order_status: o.order_status, delivered_at: o.delivered_at, days_since_delivery: days,
     policy: pol ? { id: pol.policy_rule_id, name: pol.policy_name, return_window_days: pol.return_window_days, allowed_reasons: pol.allowed_conditions,
       packaging_required: pol.packaging_required, accessories_required: pol.accessories_required } : null,
@@ -222,14 +222,25 @@ function registerTools(server, cid, ctx) {
 
   T("list_my_orders", "List the logged-in customer's recent orders (newest first).",
     { limit: z.number().int().min(1).max(20).default(8), status: z.string().optional().describe("Optional order status filter, e.g. DELIVERED") },
-    (a) => q(`select o.order_id,o.order_date,o.order_status,o.total_amount,o.currency,o.delivered_at,o.payment_status,p.product_name,p.category
+    (a) => q(`select o.order_id,o.product_id,o.order_date,o.order_status,o.total_amount,o.currency,o.delivered_at,o.payment_status,p.product_name,p.category,p.image_url
         from orders o left join products p on p.product_id=o.product_id where o.customer_id=$1 and ($2::text is null or o.order_status=$2)
         order by o.order_date desc limit $3`, [cid, a.status || null, a.limit || 8]));
 
   T("get_order_details", "Full details of one order (items, payment, delivery).", { order_id: z.string() }, async (a) => {
-    const o = await own(a.order_id); if (!o) return { error: "Order not found on your account." };
+    const o = await one(
+      `select o.*,p.product_name,p.category,p.image_url
+       from orders o left join products p on p.product_id=o.product_id
+       where o.order_id=$1 and o.customer_id=$2`,
+      [a.order_id, cid]
+    );
+    if (!o) return { error: "Order not found on your account." };
     return { order: o,
-      items: await q("select order_item_id,product_id,product_name,quantity,unit_price,total_amount,item_status,return_status from order_items where order_id=$1", [a.order_id]),
+      items: await q(
+        `select oi.order_item_id,oi.product_id,coalesce(p.product_name,oi.product_name) as product_name,oi.quantity,oi.unit_price,oi.total_amount,oi.item_status,oi.return_status,p.image_url
+         from order_items oi left join products p on p.product_id=oi.product_id
+         where oi.order_id=$1`,
+        [a.order_id]
+      ),
       payment: await one("select payment_id,payment_method,payment_status,amount,paid_at,refund_allowed from payments where order_id=$1", [a.order_id]) };
   });
 
@@ -240,17 +251,17 @@ function registerTools(server, cid, ctx) {
     (a) => eligibility(cid, a.order_id));
 
   T("list_my_cases", "List the customer's return, refund and replacement cases.", {}, async () => ({
-    returns: await q("select case_id,order_id,product_name,return_reason,return_status,pickup_status,created_at from return_requests where customer_id=$1 order by created_at desc limit 10", [cid]),
-    refunds: await q("select case_id,order_id,original_product_name product_name,status,created_at from refund_requests where customer_id=$1 order by created_at desc limit 10", [cid]),
-    replacements: await q("select case_id,order_id,original_product_name product_name,replacement_product_name,status,created_at from replacement_requests where customer_id=$1 order by created_at desc limit 10", [cid]) }));
+    returns: await q("select r.case_id,r.order_id,r.product_id,r.product_name,r.return_reason,r.return_status,r.pickup_status,r.created_at,p.image_url from return_requests r left join products p on p.product_id=r.product_id where r.customer_id=$1 order by r.created_at desc limit 10", [cid]),
+    refunds: await q("select r.case_id,r.order_id,r.original_product_id product_id,r.original_product_name product_name,r.status,r.created_at,p.image_url from refund_requests r left join products p on p.product_id=r.original_product_id where r.customer_id=$1 order by r.created_at desc limit 10", [cid]),
+    replacements: await q("select r.case_id,r.order_id,r.original_product_id product_id,r.original_product_name product_name,r.replacement_product_name,r.status,r.created_at,p.image_url from replacement_requests r left join products p on p.product_id=r.original_product_id where r.customer_id=$1 order by r.created_at desc limit 10", [cid]) }));
 
   T("get_case_status", "Detailed status of one case id (e.g. CASE000012).", { case_id: z.string() }, async (a) => ({
-    return_request: await one("select * from return_requests where case_id=$1 and customer_id=$2 order by created_at desc limit 1", [a.case_id, cid]),
-    refund_request: await one("select * from refund_requests where case_id=$1 and customer_id=$2 order by created_at desc limit 1", [a.case_id, cid]),
-    replacement_request: await one("select * from replacement_requests where case_id=$1 and customer_id=$2 order by created_at desc limit 1", [a.case_id, cid]) }));
+    return_request: await one("select r.*,p.image_url from return_requests r left join products p on p.product_id=r.product_id where r.case_id=$1 and r.customer_id=$2 order by r.created_at desc limit 1", [a.case_id, cid]),
+    refund_request: await one("select r.*,p.image_url from refund_requests r left join products p on p.product_id=r.original_product_id where r.case_id=$1 and r.customer_id=$2 order by r.created_at desc limit 1", [a.case_id, cid]),
+    replacement_request: await one("select r.*,p.image_url from replacement_requests r left join products p on p.product_id=r.original_product_id where r.case_id=$1 and r.customer_id=$2 order by r.created_at desc limit 1", [a.case_id, cid]) }));
 
   T("search_products", "Search the product catalogue by name/brand/category.", { query: z.string() },
-    (a) => q("select product_id,product_name,brand,category,base_price,returnable,replacement_allowed,exchange_allowed,warranty_days from products where active is not false and (product_name ilike $1 or brand ilike $1 or category ilike $1 or subcategory ilike $1) limit 8", ["%" + a.query + "%"]));
+    (a) => q("select product_id,product_name,brand,category,base_price,returnable,replacement_allowed,exchange_allowed,warranty_days,image_url from products where active is not false and (product_name ilike $1 or brand ilike $1 or category ilike $1 or subcategory ilike $1) limit 8", ["%" + a.query + "%"]));
 
   T("prepare_return_request",
     "Step 1 of raising a case: validates eligibility and stores the request as PENDING. Does NOT create a case. Afterwards show the summary and ask the customer to confirm.",

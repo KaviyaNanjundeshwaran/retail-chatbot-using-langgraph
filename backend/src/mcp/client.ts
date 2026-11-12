@@ -21,8 +21,13 @@ export const isMcpUp = async () => {
   }
 };
 
-export async function ensureMcpServer() {
-  if (await isMcpUp()) return;
+export async function ensureMcpServer(forceCheck = false) {
+  if (!forceCheck && G.__mcpUp) return;
+  if (await isMcpUp()) {
+    G.__mcpUp = true;
+    return;
+  }
+  G.__mcpUp = false;
   if (process.env.MCP_URL) throw new Error("MCP server not reachable at " + MCP_URL);
   if (!G.__mcpProc || G.__mcpProc.exitCode !== null) {
     const candidates = [
@@ -44,7 +49,10 @@ export async function ensureMcpServer() {
   }
   for (let i = 0; i < 40; i++) {
     await sleep(300);
-    if (await isMcpUp()) return;
+    if (await isMcpUp()) {
+      G.__mcpUp = true;
+      return;
+    }
   }
   throw new Error("MCP server failed to start (run `node mcp-server.mjs` to test)");
 }
@@ -87,11 +95,57 @@ export function toZodObject(schema: any) {
   return z.object(shape);
 }
 
+export type ProductCard = {
+  product_id?: string;
+  product_name: string;
+  image_url: string;
+  category?: string;
+  order_id?: string;
+  case_id?: string;
+};
+
+export function collectProductCards(val: any, out: ProductCard[]) {
+  if (!val || typeof val !== "object") return;
+  if (Array.isArray(val)) {
+    for (const item of val) collectProductCards(item, out);
+    return;
+  }
+  const name = val.product_name || val.original_product_name;
+  const img = val.image_url;
+  if (typeof name === "string" && name && typeof img === "string" && /^https?:\/\//i.test(img)) {
+    out.push({
+      product_id: val.product_id || undefined,
+      product_name: name,
+      image_url: img,
+      category: val.category || undefined,
+      order_id: val.order_id || undefined,
+      case_id: val.case_id || undefined,
+    });
+  }
+  for (const v of Object.values(val)) {
+    if (v && typeof v === "object") collectProductCards(v, out);
+  }
+}
+
+export function dedupeProductCards(items: ProductCard[], limit = 6): ProductCard[] {
+  const seen = new Set<string>();
+  const out: ProductCard[] = [];
+  for (const p of items) {
+    const key = `${p.product_id || ""}|${p.image_url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(p);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 export async function createMcpClient(
   customerId: string,
   ctx: { message: string; sessionId: string; turn: string },
   grounding: string[],
-  steps: string[]
+  steps: string[],
+  products?: ProductCard[]
 ) {
   await ensureMcpServer();
   const token = await new SignJWT({ sid: ctx.sessionId, msg: ctx.message, turn: ctx.turn })
@@ -101,16 +155,28 @@ export async function createMcpClient(
     .setExpirationTime("5m")
     .sign(secret());
 
-  const client = new Client({ name: "returns-agent", version: "1.0.0" });
-  await client.connect(
-    new StreamableHTTPClientTransport(new URL(MCP_URL), {
-      requestInit: { headers: { Authorization: `Bearer ${token}` } },
-    })
-  );
+  const connectClient = async () => {
+    const c = new Client({ name: "returns-agent", version: "1.0.0" });
+    await c.connect(
+      new StreamableHTTPClientTransport(new URL(MCP_URL), {
+        requestInit: { headers: { Authorization: `Bearer ${token}` } },
+      })
+    );
+    return c;
+  };
 
-  const listed = await client.listTools();
+  let client: Client;
+  try {
+    client = await connectClient();
+  } catch {
+    G.__mcpUp = false;
+    await ensureMcpServer(true);
+    client = await connectClient();
+  }
+
+  const toolsMeta: any[] = (G.__mcpTools ??= (await client.listTools()).tools);
   const byName = (names?: string[]) =>
-    listed.tools
+    toolsMeta
       .filter((t) => !names || names.includes(t.name))
       .map((t) =>
         tool(
@@ -119,6 +185,11 @@ export async function createMcpClient(
             const txt = (r.content || []).map((c: any) => c.text || "").join("");
             grounding.push(txt);
             steps.push(`mcp:${t.name}`);
+            if (products) {
+              try {
+                collectProductCards(JSON.parse(txt), products);
+              } catch {}
+            }
             return txt;
           },
           { name: t.name, description: t.description || "", schema: toZodObject(t.inputSchema) }

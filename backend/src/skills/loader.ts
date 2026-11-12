@@ -7,7 +7,10 @@ export async function createSkillTools(agentName: string) {
     "select name,description,instructions,agent from app_skills where enabled and agent in ($1,'all')",
     [agentName]
   );
-  const listing = rows.map((r: any) => `- ${r.name}: ${r.description}`).join("\n") || "(none)";
+  const listing =
+    rows
+      .map((r: any) => `- ${r.name} (${r.description}): ${String(r.instructions || "").replace(/\s*\n+\s*/g, " ")}`)
+      .join("\n") || "(none)";
 
   const t = tool(
     async ({ name }: any) => {

@@ -55,10 +55,6 @@ async function chat(req: Request, res: Response, sess: Sess) {
   const sessionId =
     String(payload.sessionId || body.config?.configurable?.thread_id || "").slice(0, 64) || randomUUID();
   const cid = sess.sub;
-  const profile = await one(
-    "select customer_id,first_name,full_name,email,phone,preferred_language from customers where customer_id=$1",
-    [cid]
-  );
   const turn = randomUUID();
 
   res.setHeader("Content-Type", "text/event-stream");
@@ -73,7 +69,13 @@ async function chat(req: Request, res: Response, sess: Sess) {
   };
 
   try {
-    const g = await getCompiledGraph();
+    const [profile, g] = await Promise.all([
+      one(
+        "select customer_id,first_name,full_name,email,phone,preferred_language from customers where customer_id=$1",
+        [cid]
+      ),
+      getCompiledGraph(),
+    ]);
     const memory = await loadLongTermMemory(cid);
 
     const stream = await g.stream(
@@ -94,6 +96,7 @@ async function chat(req: Request, res: Response, sess: Sess) {
         steps: [],
         grounding: [],
         notes: [],
+        products: [],
         cacheable: false,
         humanAppended: false,
       },
@@ -125,14 +128,16 @@ async function chat(req: Request, res: Response, sess: Sess) {
         sessionId,
         final,
         out.intent || (out.blocked ? "blocked" : null),
-        JSON.stringify({ steps: out.steps, notes: out.notes, cached: out.cached }),
+        JSON.stringify({ steps: out.steps, notes: out.notes, cached: out.cached, products: out.products || [] }),
       ]
     );
 
     send("done", { sessionId, intent: out.intent, cached: !!out.cached, notes: out.notes });
 
     if (out.cacheable && !out.blocked && !out.cached) {
-      await saveSemanticCache(out.cleaned, final, [profile?.full_name, profile?.first_name]);
+      void saveSemanticCache(out.cleaned, final, [profile?.full_name, profile?.first_name]).catch((err) =>
+        console.error("saveSemanticCache failed:", err?.message || err)
+      );
     }
 
     if (
@@ -141,7 +146,9 @@ async function chat(req: Request, res: Response, sess: Sess) {
         out.cleaned
       )
     ) {
-      await updateLongTermMemory(cid, out.cleaned, final);
+      void updateLongTermMemory(cid, out.cleaned, final).catch((err) =>
+        console.error("updateLongTermMemory failed:", err?.message || err)
+      );
     }
   } catch (e: any) {
     console.error("chat error", e);
@@ -569,7 +576,7 @@ export async function handle(req: Request, res: Response) {
         const sid = req.query.sessionId as string || "";
         return json(res,
           await q(
-            "select role,content,intent,created_at from app_chat_messages where customer_id=$1 and session_id=$2 order by id",
+            "select role,content,intent,meta,created_at from app_chat_messages where customer_id=$1 and session_id=$2 order by id",
             [sess.sub, sid]
           )
         );

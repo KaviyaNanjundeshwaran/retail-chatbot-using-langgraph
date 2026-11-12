@@ -4,7 +4,7 @@ import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 import { PostgresStore } from "@langchain/langgraph-checkpoint-postgres/store";
 import { BaseMessage, HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 import { pool, getSetting } from "../db/client";
-import { getLlm, textOfMessage, sleep } from "../llm/factory";
+import { getLlm, textOfMessage } from "../llm/factory";
 import { lookupSemanticCache } from "../cache/semantic";
 import { validateInputText, runLlmInputGuard, validateOutputText } from "../guardrails/validator";
 import { getOrchestratorPrompt, getSpeakerPrompt, SITUATIONS, INTENTS } from "../prompts/system";
@@ -33,6 +33,7 @@ export const ChatState = Annotation.Root({
   grounding: Annotation<string[]>(),
   steps: Annotation<string[]>(),
   notes: Annotation<string[]>(),
+  products: Annotation<any[]>(),
   cacheable: Annotation<boolean>(),
   humanAppended: Annotation<boolean>(),
 });
@@ -133,7 +134,7 @@ async function outputGuardNode(s: typeof ChatState.State, cfg: LangGraphRunnable
   let clean = !g.notes.length;
   const gr = await getSetting("guardrails");
 
-  if (gr.llm_output && !s.cached && clean) {
+  if (gr.llm_output && !s.cached && clean && (s.intent !== "smalltalk" || (s.grounding || []).length > 0)) {
     step(cfg, "llm_output_guardrail", "Fact-checking answer");
     try {
       const r: any = await getLlm()
@@ -179,20 +180,17 @@ async function outputGuardNode(s: typeof ChatState.State, cfg: LangGraphRunnable
 }
 
 async function speak(code: string, s: typeof ChatState.State, emit?: (t: string, d: any) => void): Promise<string> {
-  const gr = await getSetting("guardrails");
-  const msgs = await getSetting("messages");
-  const bot = (await getSetting("chat")).bot_name;
-  const push = async (t: string) => {
-    for (const w of t.split(/(\s+)/)) {
-      emit?.("token", w);
-      if (emit && w.trim()) await sleep(12);
-    }
-  };
+  const [gr, msgs, chatCfg] = await Promise.all([
+    getSetting("guardrails"),
+    getSetting("messages"),
+    getSetting("chat"),
+  ]);
+  const bot = chatCfg.bot_name;
 
   const situation = SITUATIONS[code];
   if (!situation) {
     const t = String(msgs[code] || msgs.error).split("{max}").join(String(gr.max_input_chars));
-    await push(t);
+    emit?.("token", t);
     return t;
   }
 
@@ -214,7 +212,7 @@ async function speak(code: string, s: typeof ChatState.State, emit?: (t: string,
   }
   if (!full.trim()) {
     full = String(msgs["fallback_" + code] || msgs.error);
-    await push(full);
+    emit?.("token", full);
   }
   return full;
 }
@@ -226,39 +224,11 @@ async function respondNode(s: typeof ChatState.State, cfg: LangGraphRunnableConf
 
   if (s.blocked) {
     full = await speak(s.blocked, s, emit);
-  } else if (s.cached) {
-    for (const w of s.draft.split(/(\s+)/)) {
-      full += w;
-      emit("token", w);
-      if (w.trim()) await sleep(12);
-    }
   } else {
-    const stream = await getLlm().stream([
-      new SystemMessage(
-        `You are friendly voice of ${(await getSetting("chat")).bot_name}. Rewrite verified answer for customer ${
-          s.profile?.first_name || ""
-        }. Keep all facts, IDs, and dates intact.`
-      ),
-      new HumanMessage(`Customer message: ${s.cleaned}\nVerified answer:\n${s.draft}`),
-    ]);
-    for await (const ch of stream) {
-      const t = textOfMessage(ch);
-      if (t) {
-        full += t;
-        emit("token", t);
-      }
-    }
-    const g = validateOutputText(full, {
-      cid: s.customerId,
-      email: s.profile?.email,
-      known: knownText({ ...s, grounding: [...(s.grounding || []), s.draft] }),
-    });
-    if (g.unverified || g.empty) {
-      full = await speak(g.empty ? "empty_answer" : "unverified_answer", s);
-      emit("replace", full);
-    } else if (g.text !== full) {
-      full = g.text;
-      emit("replace", full);
+    full = s.draft || "";
+    emit("token", full);
+    if (!s.cached && s.products?.length) {
+      emit("products", s.products);
     }
   }
 

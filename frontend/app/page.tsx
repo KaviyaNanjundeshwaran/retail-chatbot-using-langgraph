@@ -10,6 +10,8 @@ const api = async (path: string, opts: any = {}) => {
   return d;
 };
 const md = (t: string) => t.split("\n").map((l, i) => {
+  const img = /^\s*!\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)\s*$/.exec(l);
+  if (img) return <img key={i} className="md-img" src={img[2]} alt={img[1] || "Product image"} referrerPolicy="no-referrer" loading="lazy" onError={(e) => { e.currentTarget.style.display = "none"; }} />;
   const parts = l.split(/(\*\*[^*]+\*\*)/g).map((p, j) => (p.startsWith("**") && p.endsWith("**") ? <b key={j}>{p.slice(2, -2)}</b> : p));
   return /^\s*[-*•]\s+/.test(l) ? <div key={i} className="li">• {parts.map((p) => (typeof p === "string" ? p.replace(/^\s*[-*•]\s+/, "") : p))}</div> : <div key={i}>{parts.length ? parts : " "}</div>;
 });
@@ -46,7 +48,8 @@ function Login({ onDone }: { onDone: () => void }) {
 }
 
 /* -------------------------------- chat -------------------------------- */
-type Msg = { role: "user" | "assistant"; content: string; steps?: string[] };
+type ProductCard = { product_id?: string; product_name: string; image_url: string; category?: string; order_id?: string; case_id?: string };
+type Msg = { role: "user" | "assistant"; content: string; steps?: string[]; products?: ProductCard[] };
 function Chat({ user, logout }: { user: any; logout: () => void }) {
   const [sessions, setSessions] = useState<any[]>([]), [sid, setSid] = useState(() => crypto.randomUUID());
   const [msgs, setMsgs] = useState<Msg[]>([]), [input, setInput] = useState(""), [busy, setBusy] = useState(false), [chips, setChips] = useState<string[]>([]);
@@ -54,7 +57,7 @@ function Chat({ user, logout }: { user: any; logout: () => void }) {
   const refresh = useCallback(() => api("chat/sessions").then(setSessions).catch(() => {}), []);
   useEffect(() => { refresh(); api("chat/suggestions").then(setChips).catch(() => {}); }, [refresh]);
   useEffect(() => { end.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
-  const open = async (id: string) => { setSid(id); const h = await api("chat/history?sessionId=" + id); setMsgs(h.map((m: any) => ({ role: m.role, content: m.content }))); };
+  const open = async (id: string) => { setSid(id); const h = await api("chat/history?sessionId=" + id); setMsgs(h.map((m: any) => ({ role: m.role, content: m.content, products: m.meta?.products }))); };
   const newChat = () => { setSid(crypto.randomUUID()); setMsgs([]); };
 
   const send = async (text: string) => {
@@ -78,6 +81,7 @@ function Chat({ user, logout }: { user: any; logout: () => void }) {
         if (ev.event === "step") patch((m) => ({ ...m, steps: [...(m.steps || []), d.label] }));
         else if (ev.event === "token") patch((m) => ({ ...m, content: m.content + String(d ?? "") }));
         else if (ev.event === "replace") patch((m) => ({ ...m, content: String(d ?? "") }));
+        else if (ev.event === "products") patch((m) => ({ ...m, products: Array.isArray(d) ? d : [] }));
         else if (ev.event === "error") patch((m) => ({ ...m, content: "⚠️ " + (d?.message || "Error") }));
         else if (ev.event === "done") refresh();
       }
@@ -98,7 +102,17 @@ function Chat({ user, logout }: { user: any; logout: () => void }) {
           <div className="chips">{chips.map((c) => <button key={c} onClick={() => send(c)}>{c}</button>)}</div></div>}
         {msgs.map((m, i) => <div key={i} className={"msg " + m.role}>
           {m.role === "assistant" && !m.content && busy && i === msgs.length - 1 && <div className="steps">{(m.steps || []).slice(-1).map((s) => <span key={s}>⏳ {s}…</span>)}</div>}
-          <div className="bubble">{m.content ? md(m.content) : null}</div></div>)}
+          <div className="bubble">{m.content ? md(m.content) : null}</div>
+          {m.role === "assistant" && !!m.products?.length && <div className="product-cards">
+            {m.products.map((p, idx) => <div className="product-card" key={(p.product_id || p.image_url) + idx}>
+              <img className="product-thumb" src={p.image_url} alt={p.product_name} referrerPolicy="no-referrer" loading="lazy" onError={(e) => { e.currentTarget.style.display = "none"; }} />
+              <div className="product-info">
+                <b>{p.product_name}</b>
+                <small>{[p.order_id, p.case_id, p.category, p.product_id].filter(Boolean).join(" · ")}</small>
+              </div>
+            </div>)}
+          </div>}
+        </div>)}
         <div ref={end} />
       </div>
       <form className="composer" onSubmit={(e) => { e.preventDefault(); send(input); }}>

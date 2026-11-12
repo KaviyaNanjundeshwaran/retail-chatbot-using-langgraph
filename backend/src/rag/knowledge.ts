@@ -2,6 +2,7 @@ import { z } from "zod";
 import { tool } from "@langchain/core/tools";
 import { q, one } from "../db/client";
 import { createEmbedder, getProvider, sleep } from "../llm/factory";
+import type { ProductCard } from "../mcp/client";
 
 const G = globalThis as any;
 export const vec = (v: number[]) => "[" + v.join(",") + "]";
@@ -15,7 +16,8 @@ export const policyToText = (p: any) =>
 
 export const productToText = (p: any) =>
   `Product ${p.product_name} (${p.product_id}), brand ${p.brand}, category ${p.category} / ${p.subcategory}. ${p.description || ""} ` +
-  `Returnable: ${p.returnable ? "yes" : "no"}. Replacement allowed: ${p.replacement_allowed ? "yes" : "no"}. Exchange allowed: ${p.exchange_allowed ? "yes" : "no"}. Warranty: ${p.warranty_days} days.`;
+  `Returnable: ${p.returnable ? "yes" : "no"}. Replacement allowed: ${p.replacement_allowed ? "yes" : "no"}. Exchange allowed: ${p.exchange_allowed ? "yes" : "no"}. Warranty: ${p.warranty_days} days.` +
+  (p.image_url ? ` Image: ${p.image_url}` : "");
 
 export async function embedDocumentsWithRetry(texts: string[]): Promise<number[][]> {
   const e = createEmbedder();
@@ -87,17 +89,24 @@ export async function indexProductsBackground() {
 }
 
 export async function reindexKnowledgeBase() {
+  G.__kbReadyProv = null;
   const pol = await q("select * from policy_rules");
   await q("delete from app_kb");
   await upsertKnowledgeBase(pol.map((p: any) => ({ source: "policy", id: p.policy_rule_id, content: policyToText(p) })));
   indexProductsBackground();
+  G.__kbReadyProv = getProvider();
   return { policies: pol.length, products: "indexing in background" };
 }
 
 export async function ensureKnowledgeBase() {
-  const r = await one("select count(*)::int n from app_kb where source='policy' and provider=$1", [getProvider()]);
+  const prov = getProvider();
+  if (G.__kbReadyProv === prov) return;
+  const r = await one("select count(*)::int n from app_kb where source='policy' and provider=$1", [prov]);
   if (r.n === 0) await reindexKnowledgeBase();
-  else indexProductsBackground();
+  else {
+    G.__kbReadyProv = prov;
+    indexProductsBackground();
+  }
 }
 
 export async function searchKnowledgeBase(query: string, k = 5) {
@@ -109,11 +118,30 @@ export async function searchKnowledgeBase(query: string, k = 5) {
   );
 }
 
-export const createRagTool = (steps: string[], grounding: string[]) =>
+export async function resolveProductCardsFromKb(rows: any[], products?: ProductCard[]) {
+  if (!products) return;
+  const ids = rows.filter((r: any) => r.source === "product" && r.source_id).map((r: any) => r.source_id);
+  if (!ids.length) return;
+  const matched = await q(
+    "select product_id,product_name,category,image_url from products where product_id = any($1) and image_url is not null",
+    [ids]
+  );
+  for (const p of matched) {
+    products.push({
+      product_id: p.product_id,
+      product_name: p.product_name,
+      image_url: p.image_url,
+      category: p.category || undefined,
+    });
+  }
+}
+
+export const createRagTool = (steps: string[], grounding: string[], products?: ProductCard[]) =>
   tool(
     async ({ query }: any) => {
       const r = await searchKnowledgeBase(query, 5);
       steps.push("tool:search_knowledge");
+      await resolveProductCardsFromKb(r, products);
       const txt = r
         .map((x: any) => `[${x.source}:${x.source_id} sim=${Number(x.sim).toFixed(2)}] ${x.content}`)
         .join("\n");
