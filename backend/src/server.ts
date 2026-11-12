@@ -1,17 +1,18 @@
-import { NextRequest, NextResponse } from "next/server";
+import express, { Request, Response } from "express";
+import cookieParser from "cookie-parser";
+import cors from "cors";
 import bcrypt from "bcryptjs";
 import { SignJWT, jwtVerify } from "jose";
 import { randomUUID } from "crypto";
-import { pool, q, one, audit, bootDatabase, getSetting, DEFAULT_SETTINGS } from "@/backend/src/db/client";
-import { getProvider } from "@/backend/src/llm/factory";
+import { pool, q, one, audit, bootDatabase, getSetting, DEFAULT_SETTINGS } from "./db/client";
+import { getProvider } from "./llm/factory";
 import {
   getCompiledGraph,
   loadLongTermMemory,
   updateLongTermMemory,
-  emitters,
-} from "@/backend/src/graph/workflow";
-import { saveSemanticCache, clearSemanticCache } from "@/backend/src/cache/semantic";
-import { reindexKnowledgeBase, policyToText, upsertKnowledgeBase } from "@/backend/src/rag/knowledge";
+} from "./graph/workflow";
+import { saveSemanticCache, clearSemanticCache } from "./cache/semantic";
+import { reindexKnowledgeBase, policyToText, upsertKnowledgeBase } from "./rag/knowledge";
 import {
   sendSupportEscalationEmail,
   sendCustomerEmailNotification,
@@ -19,18 +20,14 @@ import {
   postWorkbenchJson,
   WorkbenchNotificationPayload,
   WorkbenchEscalationPayload,
-} from "@/backend/src/webhook/workbench";
-
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-export const maxDuration = 120;
+} from "./webhook/workbench";
 
 const COOKIE = "rl_session";
 const secret = () => new TextEncoder().encode(process.env.JWT_SECRET || "");
 type Sess = { sub: string; role: "customer" | "admin"; name: string };
 
-async function getSession(req: NextRequest): Promise<Sess | null> {
-  const t = req.cookies.get(COOKIE)?.value;
+async function getSession(req: Request): Promise<Sess | null> {
+  const t = req.cookies?.[COOKIE];
   if (!t || !process.env.JWT_SECRET) return null;
   try {
     return (await jwtVerify(t, secret())).payload as any;
@@ -39,7 +36,7 @@ async function getSession(req: NextRequest): Promise<Sess | null> {
   }
 }
 
-const json = (data: any, status = 200) => NextResponse.json(data, { status });
+const json = (res: Response, data: any, status = 200) => res.status(status).json(data);
 
 const loginHits = new Map<string, number[]>();
 function isLoginRateLimited(key: string, max: number, windowMs: number) {
@@ -51,108 +48,111 @@ function isLoginRateLimited(key: string, max: number, windowMs: number) {
 }
 
 /* -------------------------------- Chat Execution -------------------------------- */
-async function chat(req: NextRequest, sess: Sess) {
-  const body = await req.json().catch(() => ({}));
-  const message = String(body.message || "");
-  const sessionId = String(body.sessionId || "").slice(0, 64) || randomUUID();
+async function chat(req: Request, res: Response, sess: Sess) {
+  const body = req.body || {};
+  const payload = body.input && typeof body.input === "object" ? body.input : body;
+  const message = String(payload.message || "");
+  const sessionId =
+    String(payload.sessionId || body.config?.configurable?.thread_id || "").slice(0, 64) || randomUUID();
   const cid = sess.sub;
   const profile = await one(
     "select customer_id,first_name,full_name,email,phone,preferred_language from customers where customer_id=$1",
     [cid]
   );
   const turn = randomUUID();
-  const enc = new TextEncoder();
 
-  const stream = new ReadableStream({
-    async start(ctrl) {
-      const send = (type: string, data: any) => {
-        try {
-          ctrl.enqueue(enc.encode(`data: ${JSON.stringify({ type, data })}\n\n`));
-        } catch {}
-      };
-      emitters.set(turn, send);
-      try {
-        const g = await getCompiledGraph();
-        const memory = await loadLongTermMemory(cid);
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
 
-        const out: any = await g.invoke(
-          {
-            message,
-            customerId: cid,
-            sessionId,
-            turn,
-            profile,
-            memory,
-            cleaned: "",
-            blocked: "",
-            cached: false,
-            intent: "",
-            query: "",
-            draft: "",
-            final: "",
-            steps: [],
-            grounding: [],
-            notes: [],
-            cacheable: false,
-            humanAppended: false,
-          },
-          { configurable: { turn, thread_id: `${cid}:${sessionId}` } }
-        );
+  const send = (type: string, data: any) => {
+    try {
+      res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch {}
+  };
 
-        const final = out.final || "";
-        await q("insert into app_chat_messages(customer_id,session_id,role,content) values($1,$2,'user',$3)", [
-          cid,
-          sessionId,
-          out.cleaned || message,
-        ]);
-        await q(
-          "insert into app_chat_messages(customer_id,session_id,role,content,intent,meta) values($1,$2,'assistant',$3,$4,$5)",
-          [
-            cid,
-            sessionId,
-            final,
-            out.intent || (out.blocked ? "blocked" : null),
-            JSON.stringify({ steps: out.steps, notes: out.notes, cached: out.cached }),
-          ]
-        );
+  try {
+    const g = await getCompiledGraph();
+    const memory = await loadLongTermMemory(cid);
 
-        send("done", { sessionId, intent: out.intent, cached: !!out.cached, notes: out.notes });
-
-        if (out.cacheable && !out.blocked && !out.cached) {
-          await saveSemanticCache(out.cleaned, final, [profile?.full_name, profile?.first_name]);
-        }
-
-        if (
-          !out.blocked &&
-          /prefer|always|never|remember|contact me|call me|whatsapp|email me|text me|language|usually|from now on|going forward|my name is/i.test(
-            out.cleaned
-          )
-        ) {
-          await updateLongTermMemory(cid, out.cleaned, final);
-        }
-      } catch (e: any) {
-        console.error("chat error", e);
-        send("error", {
-          message: /No LLM key/.test(e.message)
-            ? e.message
-            : String((await getSetting("messages").catch(() => ({} as any))).error || "Error"),
-        });
-      } finally {
-        emitters.delete(turn);
-        try {
-          ctrl.close();
-        } catch {}
+    const stream = await g.stream(
+      {
+        message,
+        customerId: cid,
+        sessionId,
+        turn,
+        profile,
+        memory,
+        cleaned: "",
+        blocked: "",
+        cached: false,
+        intent: "",
+        query: "",
+        draft: "",
+        final: "",
+        steps: [],
+        grounding: [],
+        notes: [],
+        cacheable: false,
+        humanAppended: false,
+      },
+      {
+        configurable: { turn, thread_id: `${cid}:${sessionId}` },
+        streamMode: ["custom", "values"],
       }
-    },
-  });
+    );
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-    },
-  });
+    let out: any = {};
+    for await (const [mode, chunk] of stream as AsyncIterable<[string, any]>) {
+      if (mode === "custom" && chunk && typeof chunk === "object") {
+        send(chunk.type, chunk.data);
+      } else if (mode === "values" && chunk) {
+        out = chunk;
+      }
+    }
+
+    const final = out.final || "";
+    await q("insert into app_chat_messages(customer_id,session_id,role,content) values($1,$2,'user',$3)", [
+      cid,
+      sessionId,
+      out.cleaned || message,
+    ]);
+    await q(
+      "insert into app_chat_messages(customer_id,session_id,role,content,intent,meta) values($1,$2,'assistant',$3,$4,$5)",
+      [
+        cid,
+        sessionId,
+        final,
+        out.intent || (out.blocked ? "blocked" : null),
+        JSON.stringify({ steps: out.steps, notes: out.notes, cached: out.cached }),
+      ]
+    );
+
+    send("done", { sessionId, intent: out.intent, cached: !!out.cached, notes: out.notes });
+
+    if (out.cacheable && !out.blocked && !out.cached) {
+      await saveSemanticCache(out.cleaned, final, [profile?.full_name, profile?.first_name]);
+    }
+
+    if (
+      !out.blocked &&
+      /prefer|always|never|remember|contact me|call me|whatsapp|email me|text me|language|usually|from now on|going forward|my name is/i.test(
+        out.cleaned
+      )
+    ) {
+      await updateLongTermMemory(cid, out.cleaned, final);
+    }
+  } catch (e: any) {
+    console.error("chat error", e);
+    send("error", {
+      message: /No LLM key/.test(e.message)
+        ? e.message
+        : String((await getSetting("messages").catch(() => ({} as any))).error || "Error"),
+    });
+  } finally {
+    try { res.end(); } catch {}
+  }
 }
 
 /* -------------------------------- Policy Admin Helpers -------------------------------- */
@@ -204,14 +204,14 @@ async function afterPolicyChange(id: string) {
 }
 
 /* -------------------------------- Admin Endpoints -------------------------------- */
-async function admin(req: NextRequest, sess: Sess, path: string[], method: string) {
+async function admin(req: Request, res: Response, sess: Sess, path: string[], method: string) {
   const [, sub, id] = path;
-  const body = method === "GET" ? {} : await req.json().catch(() => ({}));
+  const body = method === "GET" ? {} : req.body || {};
   const who = sess.sub;
 
   if (sub === "stats") {
     const c = async (sql: string) => (await one(sql)).n;
-    return json({
+    return json(res, {
       customers: await c("select count(*)::int n from customers"),
       orders: await c("select count(*)::int n from orders"),
       cases: await c("select count(*)::int n from return_requests"),
@@ -232,31 +232,23 @@ async function admin(req: NextRequest, sess: Sess, path: string[], method: strin
   }
 
   if (sub === "policies") {
-    if (method === "GET") return json(await q("select * from policy_rules order by policy_rule_id"));
+    if (method === "GET") return json(res, await q("select * from policy_rules order by policy_rule_id"));
     if (method === "PUT" && id) {
       let f: any;
-      try {
-        f = cleanPolicy(body);
-      } catch (e: any) {
-        return json({ error: e.message }, 400);
-      }
+      try { f = cleanPolicy(body); } catch (e: any) { return json(res, { error: e.message }, 400); }
       const keys = Object.keys(f);
-      if (!keys.length) return json({ error: "Nothing to update" }, 400);
+      if (!keys.length) return json(res, { error: "Nothing to update" }, 400);
       const sets = keys.map((k, i) => `"${k}"=$${i + 2}${POLICY_FIELDS[k] === "arr" ? "::jsonb" : ""}`).join(",");
       const old = await one("select * from policy_rules where policy_rule_id=$1", [id]);
-      if (!old) return json({ error: "Policy not found" }, 404);
+      if (!old) return json(res, { error: "Policy not found" }, 404);
       await q(`update policy_rules set ${sets} where policy_rule_id=$1`, [id, ...keys.map((k) => f[k])]);
       await audit(who, "admin", "policy_updated", { id, changes: f, before: old });
-      return json({ ok: true, index: await afterPolicyChange(id) });
+      return json(res, { ok: true, index: await afterPolicyChange(id) });
     }
     if (method === "POST") {
       let f: any;
-      try {
-        f = cleanPolicy(body);
-      } catch (e: any) {
-        return json({ error: e.message }, 400);
-      }
-      if (!f.policy_name || !f.category) return json({ error: "policy_name and category are required" }, 400);
+      try { f = cleanPolicy(body); } catch (e: any) { return json(res, { error: e.message }, 400); }
+      if (!f.policy_name || !f.category) return json(res, { error: "policy_name and category are required" }, 400);
       const n = (
         await one(
           "select coalesce(max(substring(policy_rule_id from 4)::int),0)+1 n from policy_rules where policy_rule_id ~ '^POL[0-9]+$'"
@@ -264,20 +256,11 @@ async function admin(req: NextRequest, sess: Sess, path: string[], method: strin
       ).n;
       const pid = "POL" + String(n).padStart(6, "0");
       const all = {
-        _id: pid,
-        policy_rule_id: pid,
-        effective_from: new Date().toISOString(),
-        return_window_days: 7,
-        allowed_conditions: "[]",
-        packaging_required: true,
-        seal_requirement: "ORIGINAL_PACKAGING",
-        accessories_required: true,
-        refund_allowed: true,
-        replacement_allowed: true,
-        exchange_allowed: true,
-        high_risk_requires_manual_review: true,
-        active: true,
-        ...f,
+        _id: pid, policy_rule_id: pid, effective_from: new Date().toISOString(),
+        return_window_days: 7, allowed_conditions: "[]", packaging_required: true,
+        seal_requirement: "ORIGINAL_PACKAGING", accessories_required: true,
+        refund_allowed: true, replacement_allowed: true, exchange_allowed: true,
+        high_risk_requires_manual_review: true, active: true, ...f,
       };
       const ks = Object.keys(all);
       await q(
@@ -287,15 +270,15 @@ async function admin(req: NextRequest, sess: Sess, path: string[], method: strin
         ks.map((k) => (all as any)[k])
       );
       await audit(who, "admin", "policy_created", { pid, f });
-      return json({ ok: true, id: pid, index: await afterPolicyChange(pid) });
+      return json(res, { ok: true, id: pid, index: await afterPolicyChange(pid) });
     }
   }
 
   if (sub === "skills") {
-    if (method === "GET") return json(await q("select * from app_skills order by name"));
+    if (method === "GET") return json(res, await q("select * from app_skills order by name"));
     if (method === "PUT") {
       const b = body as any;
-      if (!b.name) return json({ error: "name required" }, 400);
+      if (!b.name) return json(res, { error: "name required" }, 400);
       await q(
         `insert into app_skills(name,agent,description,instructions,enabled) values($1,$2,$3,$4,$5)
          on conflict(name) do update set agent=excluded.agent,description=excluded.description,instructions=excluded.instructions,enabled=excluded.enabled,updated_at=now()`,
@@ -308,7 +291,7 @@ async function admin(req: NextRequest, sess: Sess, path: string[], method: strin
         ]
       );
       await audit(who, "admin", "skill_saved", { name: b.name });
-      return json({ ok: true });
+      return json(res, { ok: true });
     }
   }
 
@@ -316,17 +299,17 @@ async function admin(req: NextRequest, sess: Sess, path: string[], method: strin
     if (method === "GET") {
       const out: any = {};
       for (const k of Object.keys(DEFAULT_SETTINGS)) out[k] = await getSetting(k);
-      return json(out);
+      return json(res, out);
     }
     if (method === "PUT") {
       const b = body as any;
-      if (!DEFAULT_SETTINGS[b.key] || typeof b.value !== "object") return json({ error: "invalid setting" }, 400);
+      if (!DEFAULT_SETTINGS[b.key] || typeof b.value !== "object") return json(res, { error: "invalid setting" }, 400);
       await q(
         "insert into app_settings(key,value) values($1,$2) on conflict(key) do update set value=excluded.value,updated_at=now()",
         [b.key, JSON.stringify(b.value)]
       );
       await audit(who, "admin", "settings_updated", b);
-      return json({ ok: true });
+      return json(res, { ok: true });
     }
   }
 
@@ -334,17 +317,17 @@ async function admin(req: NextRequest, sess: Sess, path: string[], method: strin
     const r = await reindexKnowledgeBase();
     await clearSemanticCache();
     await audit(who, "admin", "kb_reindexed", r);
-    return json({ ok: true, ...r });
+    return json(res, { ok: true, ...r });
   }
 
   if (sub === "clear-cache" && method === "POST") {
     await clearSemanticCache();
     await audit(who, "admin", "cache_cleared");
-    return json({ ok: true });
+    return json(res, { ok: true });
   }
 
   if (sub === "conversations") {
-    return json(
+    return json(res,
       await q(
         "select m.id,m.customer_id,c.full_name,m.session_id,m.role,m.content,m.intent,m.meta,m.created_at from app_chat_messages m left join customers c on c.customer_id=m.customer_id order by m.id desc limit 100"
       )
@@ -352,12 +335,12 @@ async function admin(req: NextRequest, sess: Sess, path: string[], method: strin
   }
 
   if (sub === "audit") {
-    return json(await q("select * from app_audit order by id desc limit 100"));
+    return json(res, await q("select * from app_audit order by id desc limit 100"));
   }
 
   if (sub === "escalations") {
     if (method === "GET")
-      return json(
+      return json(res,
         await q(
           "select e.*,c.full_name,c.email from app_escalations e left join customers c on c.customer_id=e.customer_id order by e.notified_at desc limit 100"
         )
@@ -369,25 +352,39 @@ async function admin(req: NextRequest, sess: Sess, path: string[], method: strin
         [b2.status || "OPEN", who, b2.notes || null, id]
       );
       await audit(who, "admin", "escalation_updated", { id, status: b2.status });
-      return json({ ok: true });
+      return json(res, { ok: true });
     }
   }
 
-  return json({ error: "Not found" }, 404);
+  return json(res, { error: "Not found" }, 404);
 }
 
 /* -------------------------------- Main Request Dispatcher -------------------------------- */
-async function handle(req: NextRequest, method: string) {
-  const path = new URL(req.url).pathname.replace(/^\/api\/?/, "").split("/").filter(Boolean);
+export async function handle(req: Request, res: Response) {
+  const method = req.method.toUpperCase();
+  const path = req.path.replace(/^\/api\/?/, "").split("/").filter(Boolean);
+
   try {
     if (!process.env.PG_URI || !process.env.JWT_SECRET)
-      return json({ error: "Server not configured (PG_URI / JWT_SECRET)." }, 500);
+      return json(res, { error: "Server not configured (PG_URI / JWT_SECRET)." }, 500);
 
     await bootDatabase();
 
     if (method !== "GET") {
-      const o = req.headers.get("origin");
-      if (o && new URL(o).host !== req.headers.get("host")) return json({ error: "Bad origin" }, 403);
+      const origin = req.headers.origin;
+      if (origin) {
+        const originHost = new URL(origin).host;
+        const allowedHosts = new Set(
+          [
+            req.headers.host,
+            req.headers["x-forwarded-host"] as string | undefined,
+            "localhost:3000",
+            "127.0.0.1:3000",
+            ...(process.env.FRONTEND_URL ? [new URL(process.env.FRONTEND_URL).host] : []),
+          ].filter(Boolean)
+        );
+        if (!allowedHosts.has(originHost)) return json(res, { error: "Bad origin" }, 403);
+      }
     }
 
     const [a, b] = path;
@@ -395,12 +392,12 @@ async function handle(req: NextRequest, method: string) {
     // Authentication routes
     if (a === "auth") {
       if (b === "login" && method === "POST") {
-        const { role, email, password } = await req.json().catch(() => ({} as any));
+        const { role, email, password } = req.body || {};
         if (!email || !password || !["customer", "admin"].includes(role))
-          return json({ error: "Email, password and role are required." }, 400);
+          return json(res, { error: "Email, password and role are required." }, 400);
 
         if (isLoginRateLimited("login:" + String(email).toLowerCase(), 8, 600000))
-          return json({ error: "Too many attempts. Try again in a few minutes." }, 429);
+          return json(res, { error: "Too many attempts. Try again in a few minutes." }, 429);
 
         let user: any;
         let sess: Sess | null = null;
@@ -425,7 +422,7 @@ async function handle(req: NextRequest, method: string) {
 
         if (!sess) {
           await audit(String(email), role, "login_failed");
-          return json({ error: "Invalid credentials." }, 401);
+          return json(res, { error: "Invalid credentials." }, 401);
         }
 
         const token = await new SignJWT({ role: sess.role, name: sess.name })
@@ -434,27 +431,25 @@ async function handle(req: NextRequest, method: string) {
           .setExpirationTime("8h")
           .sign(secret());
 
-        const res = json({ ok: true, role: sess.role, name: sess.name });
-        res.cookies.set(COOKIE, token, {
+        res.cookie(COOKIE, token, {
           httpOnly: true,
           sameSite: "lax",
           secure: process.env.NODE_ENV === "production",
           path: "/",
-          maxAge: 8 * 3600,
+          maxAge: 8 * 3600 * 1000,
         });
         await audit(sess.sub, sess.role, "login");
-        return res;
+        return json(res, { ok: true, role: sess.role, name: sess.name });
       }
 
       if (b === "logout") {
-        const res = json({ ok: true });
-        res.cookies.set(COOKIE, "", { path: "/", maxAge: 0 });
-        return res;
+        res.clearCookie(COOKIE, { path: "/" });
+        return json(res, { ok: true });
       }
 
       if (b === "me") {
         const s = await getSession(req);
-        if (!s) return json({ user: null });
+        if (!s) return json(res, { user: null });
         const profile =
           s.role === "customer"
             ? await one(
@@ -462,18 +457,14 @@ async function handle(req: NextRequest, method: string) {
                 [s.sub]
               )
             : null;
-        return json({
+        return json(res, {
           user: {
             id: s.sub,
             role: s.role,
             name: s.name,
             profile,
             llm: (() => {
-              try {
-                return getProvider();
-              } catch {
-                return null;
-              }
+              try { return getProvider(); } catch { return null; }
             })(),
           },
         });
@@ -484,15 +475,15 @@ async function handle(req: NextRequest, method: string) {
     if (a === "webhook") {
       if (b === "escalate" && method === "POST") {
         const whSecret = process.env.WEBHOOK_SECRET || process.env.JWT_SECRET;
-        const authHdr = req.headers.get("authorization") || "";
-        if (whSecret && !authHdr.includes(whSecret)) return json({ error: "Unauthorized" }, 401);
+        const authHdr = req.headers.authorization || "";
+        if (whSecret && !authHdr.includes(whSecret)) return json(res, { error: "Unauthorized" }, 401);
 
-        const body3 = await req.json().catch(() => ({} as any));
+        const body3 = req.body || {};
         const { customer_id, session_id, reason, summary, customer_message, case_id, order_id } = body3;
-        if (!customer_id || !session_id) return json({ error: "customer_id and session_id are required" }, 400);
+        if (!customer_id || !session_id) return json(res, { error: "customer_id and session_id are required" }, 400);
 
         const customer = await one("select full_name,email,phone from customers where customer_id=$1", [customer_id]);
-        if (!customer) return json({ error: "Customer not found" }, 404);
+        if (!customer) return json(res, { error: "Customer not found" }, 404);
 
         const escalationId = "ESC" + randomUUID().replace(/-/g, "").slice(0, 10).toUpperCase();
         await q(
@@ -503,83 +494,68 @@ async function handle(req: NextRequest, method: string) {
         let snsResult: any = { ok: false };
         try {
           snsResult = await sendSupportEscalationEmail({
-            customerId: customer_id,
-            customerName: customer.full_name,
-            customerEmail: customer.email,
-            phone: customer.phone,
-            orderId: order_id,
-            caseId: case_id,
+            customerId: customer_id, customerName: customer.full_name,
+            customerEmail: customer.email, phone: customer.phone,
+            orderId: order_id, caseId: case_id,
             reason: reason || "Customer requested to speak with customer support.",
             customerMessage: customer_message || "I want to talk to customer support.",
           });
-        } catch (e: any) {
-          snsResult = { error: e.message };
-        }
+        } catch (e: any) { snsResult = { error: e.message }; }
 
         await audit(customer_id, "webhook", "escalated_to_human", { escalationId, reason, result: snsResult });
-        return json({ ok: true, escalationId, result: snsResult });
+        return json(res, { ok: true, escalationId, result: snsResult });
       }
 
       if (b === "support-escalation-email" && method === "POST") {
-        const bodyEsc = await req.json().catch(() => ({} as any));
-        const { support_team_email, email_subject, email_body, notification_type, priority, escalation_status } =
-          bodyEsc;
-        if (!email_subject || !email_body) return json({ error: "email_subject and email_body are required" }, 400);
-
+        const bodyEsc = req.body || {};
+        const { support_team_email, email_subject, email_body, notification_type, priority, escalation_status } = bodyEsc;
+        if (!email_subject || !email_body) return json(res, { error: "email_subject and email_body are required" }, 400);
         const payload: WorkbenchEscalationPayload = {
           support_team_email: support_team_email || DEFAULT_SUPPORT_TEAM_EMAIL,
-          email_subject,
-          email_body,
+          email_subject, email_body,
           notification_type: notification_type || "HUMAN_ESCALATION",
           priority: priority || "HIGH",
           escalation_status: escalation_status || "PENDING",
         };
         const result = await postWorkbenchJson(
-          process.env.SNS_WORKBENCH_ESCALATION_URL ||
-            "https://api.agents.snsihub.ai/webhook/support-escalation-email",
+          process.env.SNS_WORKBENCH_ESCALATION_URL || "https://api.agents.snsihub.ai/webhook/support-escalation-email",
           payload
         );
-        return json({ ok: result.ok, workbench: result, payload });
+        return json(res, { ok: result.ok, workbench: result, payload });
       }
 
       if (b === "customer-email-notification" && method === "POST") {
-        const body4 = await req.json().catch(() => ({} as any));
+        const body4 = req.body || {};
         const { customer_id, customer_name, customer_email, order_id, case_id, notification_type, email_subject, email_body, status, timestamp } = body4;
-        if (!customer_email || !email_subject || !email_body) {
-          return json({ error: "customer_email, email_subject and email_body are required" }, 400);
-        }
+        if (!customer_email || !email_subject || !email_body)
+          return json(res, { error: "customer_email, email_subject and email_body are required" }, 400);
         const payload: WorkbenchNotificationPayload = {
-          customer_id: customer_id || "UNKNOWN",
-          customer_name: customer_name || "Valued Customer",
-          customer_email,
-          order_id: order_id || null,
-          case_id: case_id || null,
+          customer_id: customer_id || "UNKNOWN", customer_name: customer_name || "Valued Customer",
+          customer_email, order_id: order_id || null, case_id: case_id || null,
           notification_type: notification_type || "RETURN_STATUS_UPDATE",
-          email_subject,
-          email_body,
-          status: status || "SUCCESS",
+          email_subject, email_body, status: status || "SUCCESS",
           timestamp: timestamp || new Date().toISOString(),
         };
         const result = await sendCustomerEmailNotification(payload);
-        return json({ ok: result.ok, workbench: result, payload });
+        return json(res, { ok: result.ok, workbench: result, payload });
       }
     }
 
     // Protected customer and admin routes
     const sess = await getSession(req);
-    if (!sess) return json({ error: "Not authenticated" }, 401);
+    if (!sess) return json(res, { error: "Not authenticated" }, 401);
 
     if (a === "admin") {
-      if (sess.role !== "admin") return json({ error: "Forbidden" }, 403);
-      return admin(req, sess, path, method);
+      if (sess.role !== "admin") return json(res, { error: "Forbidden" }, 403);
+      return admin(req, res, sess, path, method);
     }
 
     if (a === "chat") {
-      if (sess.role !== "customer") return json({ error: "Forbidden" }, 403);
-      if (!b && method === "POST") return chat(req, sess);
+      if (sess.role !== "customer") return json(res, { error: "Forbidden" }, 403);
+      if (!b && method === "POST") return chat(req, res, sess);
 
       if (b === "sessions") {
-        return json(
+        return json(res,
           await q(
             `select session_id,min(created_at) started,max(created_at) updated,
              (array_agg(content order by id) filter (where role='user'))[1] title
@@ -590,8 +566,8 @@ async function handle(req: NextRequest, method: string) {
       }
 
       if (b === "history") {
-        const sid = new URL(req.url).searchParams.get("sessionId") || "";
-        return json(
+        const sid = req.query.sessionId as string || "";
+        return json(res,
           await q(
             "select role,content,intent,created_at from app_chat_messages where customer_id=$1 and session_id=$2 order by id",
             [sess.sub, sid]
@@ -609,18 +585,15 @@ async function handle(req: NextRequest, method: string) {
           out.push(`Can I return ${o.product_name}?`);
           out.push(`I want a refund for order ${o.order_id}`);
         }
-        const c = await one(
-          "select case_id from return_requests where customer_id=$1 order by created_at desc limit 1",
-          [sess.sub]
-        );
+        const c = await one("select case_id from return_requests where customer_id=$1 order by created_at desc limit 1", [sess.sub]);
         if (c) out.push(`What's the status of ${c.case_id}?`);
         const pol = await one("select category from policy_rules where active order by random() limit 1");
         if (pol) out.push(`What is the replacement policy for ${pol.category}?`);
-        return json(out);
+        return json(res, out);
       }
 
       if (b === "escalate" && method === "POST") {
-        const body2 = await req.json().catch(() => ({} as any));
+        const body2 = req.body || {};
         const sessionId = String(body2.sessionId || "").slice(0, 64);
         const reason = String(body2.reason || "Customer requested to speak with customer support.").slice(0, 500);
         const custMsg = String(body2.customerMessage || "I want to talk to customer support.").slice(0, 500);
@@ -635,14 +608,8 @@ async function handle(req: NextRequest, method: string) {
             .join("\n") || custMsg;
 
         const profile2 = await one("select full_name,email,phone from customers where customer_id=$1", [sess.sub]);
-        const lastOrder = await one(
-          "select order_id from orders where customer_id=$1 order by order_date desc limit 1",
-          [sess.sub]
-        );
-        const lastCase = await one(
-          "select case_id from return_requests where customer_id=$1 order by created_at desc limit 1",
-          [sess.sub]
-        );
+        const lastOrder = await one("select order_id from orders where customer_id=$1 order by order_date desc limit 1", [sess.sub]);
+        const lastCase = await one("select case_id from return_requests where customer_id=$1 order by created_at desc limit 1", [sess.sub]);
         const escalationId = "ESC" + randomUUID().replace(/-/g, "").slice(0, 10).toUpperCase();
 
         await q(
@@ -653,37 +620,40 @@ async function handle(req: NextRequest, method: string) {
         let snsResult: any = { ok: false };
         try {
           snsResult = await sendSupportEscalationEmail({
-            customerId: sess.sub,
-            customerName: profile2?.full_name || sess.name,
-            customerEmail: profile2?.email || "",
-            phone: profile2?.phone || "",
-            orderId: lastOrder?.order_id,
-            caseId: lastCase?.case_id,
-            reason,
-            customerMessage: custMsg,
+            customerId: sess.sub, customerName: profile2?.full_name || sess.name,
+            customerEmail: profile2?.email || "", phone: profile2?.phone || "",
+            orderId: lastOrder?.order_id, caseId: lastCase?.case_id,
+            reason, customerMessage: custMsg,
           });
-        } catch (e: any) {
-          snsResult = { error: e.message };
-        }
+        } catch (e: any) { snsResult = { error: e.message }; }
 
         await audit(sess.sub, "customer", "escalated_to_human", { escalationId, reason, result: snsResult });
-        return json({
-          ok: true,
-          escalationId,
+        return json(res, {
+          ok: true, escalationId,
           message: "A support agent has been notified by email and will follow up with you shortly.",
           workbench: snsResult,
         });
       }
     }
 
-    return json({ error: "Not found" }, 404);
+    return json(res, { error: "Not found" }, 404);
   } catch (e: any) {
     console.error("api error", path.join("/"), e);
-    return json({ error: "Server error: " + e.message }, 500);
+    return json(res, { error: "Server error: " + e.message }, 500);
   }
 }
 
-export const GET = (r: NextRequest) => handle(r, "GET");
-export const POST = (r: NextRequest) => handle(r, "POST");
-export const PUT = (r: NextRequest) => handle(r, "PUT");
-
+/* -------------------------------- Express App Factory -------------------------------- */
+export function createApp() {
+  const app = express();
+  const allowedOrigins = [
+    process.env.FRONTEND_URL || "http://localhost:3000",
+    "http://127.0.0.1:3000",
+  ];
+  app.use(cors({ origin: allowedOrigins, credentials: true }));
+  app.use(cookieParser());
+  app.use(express.json());
+  app.get("/health", (_req, res) => res.json({ ok: true }));
+  app.use("/api", (req, res) => handle(req, res));
+  return app;
+}

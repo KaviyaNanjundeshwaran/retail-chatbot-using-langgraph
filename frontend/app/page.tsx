@@ -1,6 +1,7 @@
 "use client";
 /* Single-page UI: Login (customer/admin) -> Chat (customer) | Dashboard (admin) */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { FetchStreamTransport } from "@langchain/langgraph-sdk/react";
 
 const api = async (path: string, opts: any = {}) => {
   const r = await fetch("/api/" + path, { credentials: "same-origin", headers: { "Content-Type": "application/json" }, ...opts, body: opts.body ? JSON.stringify(opts.body) : undefined });
@@ -19,7 +20,6 @@ export default function Page() {
   useEffect(() => { load(); }, [load]);
   const logout = async () => { await api("auth/logout", { method: "POST" }); setUser(null); };
   return (<>
-    <style>{css}</style>
     {user === undefined ? <div className="center muted">Loading…</div>
       : !user ? <Login onDone={load} />
       : user.role === "admin" ? <Admin user={user} logout={logout} />
@@ -63,22 +63,23 @@ function Chat({ user, logout }: { user: any; logout: () => void }) {
     setMsgs((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "", steps: [] }]);
     const patch = (fn: (m: Msg) => Msg) => setMsgs((all) => { const c = [...all]; c[c.length - 1] = fn(c[c.length - 1]); return c; });
     try {
-      const r = await fetch("/api/chat", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: text, sessionId: sid }) });
-      if (!r.ok || !r.body) throw new Error((await r.json().catch(() => ({}))).error || "Request failed");
-      const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read(); if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let i; while ((i = buf.indexOf("\n\n")) >= 0) {
-          const line = buf.slice(0, i); buf = buf.slice(i + 2);
-          if (!line.startsWith("data: ")) continue;
-          const ev = JSON.parse(line.slice(6));
-          if (ev.type === "step") patch((m) => ({ ...m, steps: [...(m.steps || []), ev.data.label] }));
-          else if (ev.type === "token") patch((m) => ({ ...m, content: m.content + ev.data }));
-          else if (ev.type === "replace") patch((m) => ({ ...m, content: ev.data }));
-          else if (ev.type === "error") patch((m) => ({ ...m, content: "⚠️ " + ev.data.message }));
-          else if (ev.type === "done") refresh();
-        }
+      const transport = new FetchStreamTransport({
+        apiUrl: "/api/chat",
+        fetch: (url, init) => fetch(url, { ...init, credentials: "same-origin" }),
+      });
+      const stream = await transport.stream({
+        input: { message: text, sessionId: sid } as any,
+        context: undefined,
+        command: undefined,
+        signal: new AbortController().signal,
+      });
+      for await (const ev of stream) {
+        const d: any = ev.data;
+        if (ev.event === "step") patch((m) => ({ ...m, steps: [...(m.steps || []), d.label] }));
+        else if (ev.event === "token") patch((m) => ({ ...m, content: m.content + String(d ?? "") }));
+        else if (ev.event === "replace") patch((m) => ({ ...m, content: String(d ?? "") }));
+        else if (ev.event === "error") patch((m) => ({ ...m, content: "⚠️ " + (d?.message || "Error") }));
+        else if (ev.event === "done") refresh();
       }
     } catch (e: any) { patch((m) => ({ ...m, content: "⚠️ " + e.message })); } finally { setBusy(false); }
   };
@@ -91,7 +92,7 @@ function Chat({ user, logout }: { user: any; logout: () => void }) {
       <div className="me"><b>{user.name}</b><small>{user.id} · {user.profile?.loyalty?.tier || user.profile?.customer_type}</small><button onClick={logout}>Sign out</button></div>
     </aside>
     <main>
-      <header>Returns &amp; Refunds Assistant<small>{user.llm ? "powered by " + user.llm : "⚠️ no LLM key configured"}</small></header>
+      <header>Returns &amp; Refunds Assistant</header>
       <div className="msgs">
         {!msgs.length && <div className="hello"><h2>Hi {user.profile?.first_name || user.name} 👋</h2><p className="muted">I can help with returns, refunds and replacements: eligibility, requests, case status and policies.</p>
           <div className="chips">{chips.map((c) => <button key={c} onClick={() => send(c)}>{c}</button>)}</div></div>}
@@ -236,46 +237,3 @@ function Table({ path, cols }: { path: string; cols: string[] }) {
   return (<div className="scroll"><table><thead><tr>{cols.map((c) => <th key={c}>{c}</th>)}</tr></thead><tbody>
     {d.map((r: any, i: number) => <tr key={i}>{cols.map((c) => <td key={c}>{typeof r[c] === "object" ? JSON.stringify(r[c]) : String(r[c] ?? "").slice(0, 220)}</td>)}</tr>)}</tbody></table></div>);
 }
-
-/* -------------------------------- styles -------------------------------- */
-const css = `
-:root{--bg:#f6f7fb;--panel:#fff;--text:#1b1f2a;--muted:#6b7280;--line:#e5e7eb;--brand:#4f46e5;--brand2:#eef2ff;--err:#b91c1c;--green:#15803d}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1117;--panel:#181b24;--text:#e8eaf0;--muted:#9aa3b2;--line:#2a2f3c;--brand:#818cf8;--brand2:#232744;--err:#f87171;--green:#4ade80}}
-*{box-sizing:border-box}body{background:var(--bg);color:var(--text);font:15px/1.5 system-ui,Segoe UI,sans-serif}
-button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:8px;padding:7px 12px}
-button.primary{background:var(--brand);color:#fff;border-color:var(--brand)}button:disabled{opacity:.55;cursor:default}
-input,select,textarea{font:inherit;width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text)}
-label{display:block;font-size:13px;color:var(--muted);margin:10px 0}label input,label select,label textarea{margin-top:4px;color:var(--text)}
-.muted,small{color:var(--muted)}.err{color:var(--err);margin:8px 0}.grow{flex:1}
-.center{min-height:100vh;display:grid;place-items:center;padding:16px}.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
-.login{width:100%;max-width:380px}.login h1{margin:0}.tabs{display:flex;gap:6px;margin:14px 0}.tabs button{flex:1}.tabs .on,nav .on{background:var(--brand2);border-color:var(--brand);color:var(--brand)}
-.login .primary{width:100%;margin-top:6px}
-.app{display:grid;grid-template-columns:270px 1fr;height:100vh}aside{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:12px;gap:10px;min-height:0}
-.list{flex:1;overflow:auto;display:flex;flex-direction:column;gap:6px}.item{text-align:left;display:flex;flex-direction:column;border:1px solid transparent;background:none}.item.on{background:var(--brand2);border-color:var(--brand)}
-.me{border-top:1px solid var(--line);padding-top:10px;display:flex;flex-direction:column;gap:4px}
-main{display:flex;flex-direction:column;min-width:0;height:100vh}main header{padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel);font-weight:600;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
-.msgs{flex:1;overflow:auto;padding:20px;display:flex;flex-direction:column;gap:12px}.hello{margin:auto;text-align:center;max-width:560px}
-.chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:14px}.chips button{border-radius:999px;background:var(--brand2);border-color:var(--brand)}
-.msg{display:flex;flex-direction:column;max-width:760px}.msg.user{align-self:flex-end;align-items:flex-end}.bubble{padding:10px 14px;border-radius:14px;background:var(--panel);border:1px solid var(--line)}
-.msg.user .bubble{background:var(--brand);color:#fff;border-color:var(--brand)}.bubble:empty{display:none}.steps{font-size:13px;color:var(--muted);padding:4px 2px}.li{padding-left:6px}
-.composer{display:flex;gap:8px;padding:14px 20px;border-top:1px solid var(--line);background:var(--panel)}
-.escalate-btn{font-size:13px;padding:5px 11px;border-radius:999px;background:var(--brand2);border-color:var(--brand);color:var(--brand);white-space:nowrap;flex-shrink:0}
-.escalate-btn:hover:not(:disabled){background:var(--brand);color:#fff}
-.esc-badge{font-size:13px;color:var(--green);padding:5px 11px;border:1px solid var(--green);border-radius:999px;white-space:nowrap;flex-shrink:0}
-.esc-banner{background:#fefce8;border-bottom:1px solid #fde047;padding:10px 20px;font-size:14px;color:#713f12}
-@media(prefers-color-scheme:dark){.esc-banner{background:#2d2800;border-color:#a16207;color:#fde68a}}
-.admin header{display:flex;gap:12px;align-items:center;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}nav{display:flex;gap:6px;flex-wrap:wrap}
-.admin section{padding:20px;max-width:1200px;margin:auto}.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px;margin-bottom:16px}
-.stat b{display:block;font-size:26px}.row{display:flex;gap:8px;align-items:center;margin:12px 0;flex-wrap:wrap}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.bar{display:grid;grid-template-columns:150px 1fr 40px;gap:8px;align-items:center;font-size:13px;margin:6px 0}.bar div{background:var(--line);border-radius:4px;height:8px}.bar i{display:block;height:8px;background:var(--brand);border-radius:4px}
-.scroll{overflow:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel)}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--muted)}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;padding:16px;z-index:10}.form{width:100%;max-width:560px;max-height:90vh;overflow:auto}
-.checks{display:grid;grid-template-columns:1fr 1fr;gap:4px}.chk{display:flex;align-items:center;gap:8px;color:var(--text)}.chk input{width:auto;margin:0}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:10px;z-index:20}
-.esc-list{display:flex;flex-direction:column;gap:14px}.esc-card{display:flex;flex-direction:column;gap:8px}
-.esc-header{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.esc-id{font-family:monospace;font-size:12px;background:var(--brand2);color:var(--brand);padding:2px 8px;border-radius:6px}
-.esc-status{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}.esc-meta{font-size:13px;color:var(--muted)}.esc-reason{margin:0;font-size:14px}
-.esc-summary{font-size:12px;white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;margin:6px 0;max-height:200px;overflow:auto}
-details summary{cursor:pointer;font-size:13px;padding:4px 0;color:var(--muted)}
-@media (max-width:800px){.app{grid-template-columns:1fr;height:auto}aside{max-height:210px}main{height:80vh}.two{grid-template-columns:1fr}}
-`;

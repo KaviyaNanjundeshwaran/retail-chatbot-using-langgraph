@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { StateGraph, Annotation, START, END } from "@langchain/langgraph";
+import { StateGraph, Annotation, START, END, LangGraphRunnableConfig } from "@langchain/langgraph";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 import { PostgresStore } from "@langchain/langgraph-checkpoint-postgres/store";
 import { BaseMessage, HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
@@ -37,22 +37,24 @@ export const ChatState = Annotation.Root({
   humanAppended: Annotation<boolean>(),
 });
 
-export const emitters = (G.__emitters ??= new Map<string, (t: string, d: any) => void>());
-export const emitOf = (cfg: any) => (emitters.get(cfg?.configurable?.turn) as any) || (() => {});
-export const step = (cfg: any, node: string, label: string) => emitOf(cfg)("step", { node, label });
+export const emitOf = (cfg?: LangGraphRunnableConfig) => (type: string, data: any) =>
+  cfg?.writer?.({ type, data });
+
+export const step = (cfg: LangGraphRunnableConfig | undefined, node: string, label: string) =>
+  emitOf(cfg)("step", { node, label });
 
 export const knownText = (s: any) =>
   [s.message, s.memory, ...(s.messages || []).map(textOfMessage), ...(s.grounding || []), s.profile?.customer_id].join(
     "\n"
   );
 
-async function inputGuardNode(s: typeof ChatState.State, cfg: any) {
+async function inputGuardNode(s: typeof ChatState.State, cfg: LangGraphRunnableConfig) {
   step(cfg, "input_guardrails", "Checking your message");
   const res = await validateInputText(s.message, s.customerId);
   return { cleaned: res.cleaned, notes: res.notes, blocked: res.blocked };
 }
 
-async function cacheNode(s: typeof ChatState.State, cfg: any) {
+async function cacheNode(s: typeof ChatState.State, cfg: LangGraphRunnableConfig) {
   step(cfg, "semantic_cache", "Looking for a cached answer");
   const res = await lookupSemanticCache(s.cleaned, s.profile?.first_name);
   if (res.hit && res.answer) {
@@ -68,7 +70,7 @@ async function cacheNode(s: typeof ChatState.State, cfg: any) {
   return { cached: false };
 }
 
-async function llmGuardNode(s: typeof ChatState.State, cfg: any) {
+async function llmGuardNode(s: typeof ChatState.State, cfg: LangGraphRunnableConfig) {
   const human = { messages: [new HumanMessage(s.cleaned)], humanAppended: true };
   const gr = await getSetting("guardrails");
   if (!gr.llm_input) return human;
@@ -93,7 +95,7 @@ async function llmGuardNode(s: typeof ChatState.State, cfg: any) {
   }
 }
 
-async function orchestratorNode(s: typeof ChatState.State, cfg: any) {
+async function orchestratorNode(s: typeof ChatState.State, cfg: LangGraphRunnableConfig) {
   step(cfg, "orchestrator", "Routing your request");
   const schema = z.object({
     intent: z.enum(INTENTS),
@@ -115,7 +117,7 @@ async function orchestratorNode(s: typeof ChatState.State, cfg: any) {
   };
 }
 
-async function outputGuardNode(s: typeof ChatState.State, cfg: any) {
+async function outputGuardNode(s: typeof ChatState.State, cfg: LangGraphRunnableConfig) {
   step(cfg, "output_guardrails", "Verifying the answer");
   if (s.blocked) return {};
   const g = validateOutputText(s.draft, {
@@ -217,7 +219,7 @@ async function speak(code: string, s: typeof ChatState.State, emit?: (t: string,
   return full;
 }
 
-async function respondNode(s: typeof ChatState.State, cfg: any) {
+async function respondNode(s: typeof ChatState.State, cfg: LangGraphRunnableConfig) {
   const emit = emitOf(cfg);
   step(cfg, "orchestrator_response", "Writing your answer");
   let full = "";
@@ -273,7 +275,7 @@ const routeIntent = (s: typeof ChatState.State) =>
     out_of_scope: "scope_refusal",
   } as any)[s.intent] || "general";
 
-async function scopeRefusalNode(s: typeof ChatState.State, cfg: any) {
+async function scopeRefusalNode(s: typeof ChatState.State, cfg: LangGraphRunnableConfig) {
   step(cfg, "scope_guardrail", "Checking scope");
   return { blocked: "off_topic", notes: [...(s.notes || []), "off_topic_refused"] };
 }
@@ -294,10 +296,10 @@ export async function getCompiledGraph() {
       .addNode("cache", cacheNode)
       .addNode("llm_guard", llmGuardNode)
       .addNode("orchestrator", orchestratorNode)
-      .addNode("policy", (s, c) => executeSubAgent("policy", s, (lbl) => step(c, "policy_agent", lbl)))
-      .addNode("orders", (s, c) => executeSubAgent("orders", s, (lbl) => step(c, "orders_agent", lbl)))
-      .addNode("returns", (s, c) => executeSubAgent("returns", s, (lbl) => step(c, "returns_agent", lbl)))
-      .addNode("general", (s, c) => executeSubAgent("general", s, (lbl) => step(c, "general_agent", lbl)))
+      .addNode("policy", (s, c) => executeSubAgent("policy", s, c))
+      .addNode("orders", (s, c) => executeSubAgent("orders", s, c))
+      .addNode("returns", (s, c) => executeSubAgent("returns", s, c))
+      .addNode("general", (s, c) => executeSubAgent("general", s, c))
       .addNode("output_guard", outputGuardNode)
       .addNode("respond", respondNode)
       .addNode("scope_refusal", scopeRefusalNode)
@@ -363,4 +365,3 @@ export async function updateLongTermMemory(cid: string, user: string, bot: strin
       await store.put(["memory", cid], f.key.slice(0, 60).replace(/\W+/g, "_"), { text: f.value.slice(0, 300) });
   } catch {}
 }
-

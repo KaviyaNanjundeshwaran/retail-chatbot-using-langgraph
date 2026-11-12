@@ -9,6 +9,7 @@
    a prompt-injected model cannot read another customer's data.
    ===================================================================== */
 import http from "node:http";
+import path from "node:path";
 import { randomBytes } from "node:crypto";
 import pg from "pg";
 import { jwtVerify } from "jose";
@@ -16,9 +17,8 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-try { process.loadEnvFile("backend/.env"); } catch {}
-try { process.loadEnvFile("backend/.env.local"); } catch {}
-try { process.loadEnvFile(".env.local"); } catch {}
+try { process.loadEnvFile(path.join(import.meta.dirname, ".env")); } catch {}
+try { process.loadEnvFile(path.join(import.meta.dirname, ".env.local")); } catch {}
 const PORT = Number(process.env.MCP_PORT || 3333);
 if (!process.env.PG_URI || !process.env.JWT_SECRET) { console.error("[mcp] PG_URI and JWT_SECRET are required"); process.exit(1); }
 const secret = new TextEncoder().encode(process.env.JWT_SECRET);
@@ -31,7 +31,7 @@ const audit = (actor, role, action, detail = {}) =>
 /* ---- SNS Workbench Email Notification Webhook ---- */
 const WORKBENCH_WEBHOOK_URL = process.env.SNS_WORKBENCH_NOTIFICATION_URL || "https://api.agents.snsihub.ai/webhook/customer-email-notification";
 const WORKBENCH_ESCALATION_URL = process.env.SNS_WORKBENCH_ESCALATION_URL || "https://api.agents.snsihub.ai/webhook/support-escalation-email";
-const DEFAULT_SUPPORT_TEAM_EMAIL = process.env.SUPPORT_TEAM_EMAIL || "kaviyaak1520@gmail.com";
+const DEFAULT_SUPPORT_TEAM_EMAIL = process.env.SUPPORT_TEAM_EMAIL || "support@retail.local";
 
 async function postToUrl(url, payload) {
   try {

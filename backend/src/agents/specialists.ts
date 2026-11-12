@@ -1,4 +1,13 @@
-import { BaseMessage, SystemMessage, ToolMessage } from "@langchain/core/messages";
+import { AIMessage, BaseMessage, SystemMessage } from "@langchain/core/messages";
+import {
+  END,
+  GraphRecursionError,
+  LangGraphRunnableConfig,
+  MessagesAnnotation,
+  START,
+  StateGraph,
+} from "@langchain/langgraph";
+import { ToolNode, toolsCondition } from "@langchain/langgraph/prebuilt";
 import { getLlm, textOfMessage } from "../llm/factory";
 import { getSetting } from "../db/client";
 import { createSkillTools } from "../skills/loader";
@@ -17,9 +26,13 @@ const firstHuman = (h: BaseMessage[]) => {
 export async function executeSubAgent(
   agent: SubAgentType,
   state: any,
-  emitStep: (label: string) => void
+  cfg?: LangGraphRunnableConfig
 ) {
-  emitStep(`Running ${agent} specialist`);
+  cfg?.writer?.({
+    type: "step",
+    data: { node: `${agent}_agent`, label: `Running ${agent} specialist` },
+  });
+
   const grounding: string[] = [];
   const steps: string[] = [];
   const cs = await getSetting("chat");
@@ -84,27 +97,33 @@ export async function executeSubAgent(
     );
 
     const model = getLlm().bindTools(tools);
-    const recent = (state.messages || []).slice(-((cs.history_window || 10) + 1));
-    const msgs: BaseMessage[] = [new SystemMessage(systemPrompt), ...firstHuman(recent)];
+    const agentGraph = new StateGraph(MessagesAnnotation)
+      .addNode("agent", async (s) => {
+        const res = await model.invoke([new SystemMessage(systemPrompt), ...s.messages]);
+        return { messages: [res] };
+      })
+      .addNode("tools", new ToolNode(tools))
+      .addEdge(START, "agent")
+      .addConditionalEdges("agent", toolsCondition, {
+        tools: "tools",
+        [END]: END,
+      })
+      .addEdge("tools", "agent")
+      .compile();
 
+    const recent = (state.messages || []).slice(-((cs.history_window || 10) + 1));
     let text = "";
-    for (let i = 0; i < (cs.max_tool_steps || 6); i++) {
-      const res: any = await model.invoke(msgs);
-      msgs.push(res);
-      if (!res.tool_calls?.length) {
-        text = textOfMessage(res);
-        break;
+    try {
+      const result = await agentGraph.invoke(
+        { messages: firstHuman(recent) },
+        { recursionLimit: 2 * (cs.max_tool_steps || 6) + 1 }
+      );
+      const last = result.messages?.[result.messages.length - 1];
+      if (AIMessage.isInstance(last) && !last.tool_calls?.length) {
+        text = textOfMessage(last);
       }
-      for (const c of res.tool_calls) {
-        const t = tools.find((x) => x.name === c.name);
-        let out: string;
-        try {
-          out = t ? String(await t.invoke(c.args)) : "Unknown tool";
-        } catch (e: any) {
-          out = "Error: " + e.message;
-        }
-        msgs.push(new ToolMessage({ content: out, tool_call_id: c.id, name: c.name }));
-      }
+    } catch (e: any) {
+      if (!(e instanceof GraphRecursionError)) throw e;
     }
 
     if (!text) {
@@ -127,4 +146,3 @@ export async function executeSubAgent(
     await mcp.close().catch(() => {});
   }
 }
-

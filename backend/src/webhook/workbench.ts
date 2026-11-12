@@ -7,7 +7,7 @@ const WORKBENCH_ESCALATION_URL =
   "https://api.agents.snsihub.ai/webhook/support-escalation-email";
 
 export const DEFAULT_SUPPORT_TEAM_EMAIL =
-  process.env.SUPPORT_TEAM_EMAIL || "kaviyaak1520@gmail.com";
+  process.env.SUPPORT_TEAM_EMAIL || "support@retail.local";
 
 export interface WorkbenchNotificationPayload {
   customer_id: string;

@@ -4,6 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SignJWT } from "jose";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { sleep } from "../llm/factory";
 
@@ -24,7 +25,12 @@ export async function ensureMcpServer() {
   if (await isMcpUp()) return;
   if (process.env.MCP_URL) throw new Error("MCP server not reachable at " + MCP_URL);
   if (!G.__mcpProc || G.__mcpProc.exitCode !== null) {
-    const serverPath = path.join(process.cwd(), "backend", "mcp-server.mjs");
+    const candidates = [
+      path.resolve(__dirname, "../../mcp-server.mjs"),
+      path.join(process.cwd(), "mcp-server.mjs"),
+      path.join(process.cwd(), "backend", "mcp-server.mjs"),
+    ];
+    const serverPath = candidates.find((p) => fs.existsSync(p)) || candidates[0];
     G.__mcpProc = spawn(process.execPath, [serverPath], {
       stdio: "inherit",
       env: process.env,
